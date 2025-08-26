@@ -1,0 +1,779 @@
+// AegisKernel.sys - Kernel Mode Driver
+#include <ntddk.h>
+#include <wdf.h>
+#include <wdm.h>
+
+#define AEGIS_POOL_TAG 'gisA'
+
+// Function types for SSDT hooks
+typedef NTSTATUS(NTAPI* PNtCreateFile)(
+    PHANDLE FileHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize,
+    ULONG FileAttributes,
+    ULONG ShareAccess,
+    ULONG CreateDisposition,
+    ULONG CreateOptions,
+    PVOID EaBuffer,
+    ULONG EaLength
+    );
+
+typedef NTSTATUS(NTAPI* PNtOpenProcess)(
+    PHANDLE ProcessHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PCLIENT_ID ClientId
+    );
+
+typedef NTSTATUS(NTAPI* PNtWriteFile)(
+    HANDLE FileHandle,
+    HANDLE Event,
+    PVOID ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID Buffer,
+    ULONG Length,
+    PLARGE_INTEGER ByteOffset,
+    PULONG Key
+    );
+
+typedef NTSTATUS(NTAPI* PNtReadVirtualMemory)(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    ULONG NumberOfBytesToRead,
+    PULONG NumberOfBytesRead
+    );
+
+typedef NTSTATUS(NTAPI* PNtWriteVirtualMemory)(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    ULONG NumberOfBytesToWrite,
+    PULONG NumberOfBytesWritten
+    );
+
+typedef NTSTATUS(NTAPI* PNtSetInformationFile)(
+    HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation,
+    ULONG Length,
+    FILE_INFORMATION_CLASS FileInformationClass
+    );
+
+typedef NTSTATUS(NTAPI* PNtCreateSection)(
+    OUT PHANDLE SectionHandle,
+    IN ACCESS_MASK DesiredAccess,
+    IN POBJECT_ATTRIBUTES ObjectAttributes OPTIONAL,
+    IN PLARGE_INTEGER MaximumSize OPTIONAL,
+    IN ULONG SectionPageProtection,
+    IN ULONG AllocationAttributes,
+    IN HANDLE FileHandle OPTIONAL
+    );
+
+// Original function pointers
+PNtCreateFile OriginalNtCreateFile = NULL;
+PNtOpenProcess OriginalNtOpenProcess = NULL;
+PNtWriteFile OriginalNtWriteFile = NULL;
+PNtReadVirtualMemory OriginalNtReadVirtualMemory = NULL;
+PNtWriteVirtualMemory OriginalNtWriteVirtualMemory = NULL;
+PNtSetInformationFile OriginalNtSetInformationFile = NULL;
+PNtCreateSection OriginalNtCreateSection = NULL;
+
+// SSDT structure
+typedef struct _SYSTEM_SERVICE_DESCRIPTOR_TABLE {
+    PULONG ServiceTableBase;
+    PULONG ServiceCounterTableBase;
+    ULONG NumberOfServices;
+    PUCHAR ParamTableBase;
+} SYSTEM_SERVICE_DESCRIPTOR_TABLE, *PSYSTEM_SERVICE_DESCRIPTOR_TABLE;
+
+// Global variables
+PSYSTEM_SERVICE_DESCRIPTOR_TABLE KeServiceDescriptorTable = NULL;
+PVOID g_SSDTOriginal = NULL;
+ULONG g_SSDTSize = 0;
+PDEVICE_OBJECT g_DeviceObject = NULL;
+UNICODE_STRING g_DeviceName, g_SymbolicName;
+
+// Communication structure between kernel and user mode
+typedef struct _AEGIS_EVENT {
+    ULONG ProcessId;
+    ULONG ThreadId;
+    ULONG EventType;
+    UNICODE_STRING FilePath;
+    UNICODE_STRING TargetProcess;
+    LARGE_INTEGER Timestamp;
+} AEGIS_EVENT, *PAEGIS_EVENT;
+
+// Function prototypes
+DRIVER_INITIALIZE DriverEntry;
+DRIVER_UNLOAD DriverUnload;
+NTSTATUS DriverCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS DriverDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+VOID HookSSDT();
+VOID UnhookSSDT();
+NTSTATUS NTAPI HookedNtCreateFile(
+    PHANDLE FileHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize,
+    ULONG FileAttributes,
+    ULONG ShareAccess,
+    ULONG CreateDisposition,
+    ULONG CreateOptions,
+    PVOID EaBuffer,
+    ULONG EaLength
+    );
+NTSTATUS NTAPI HookedNtOpenProcess(
+    PHANDLE ProcessHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PCLIENT_ID ClientId
+    );
+NTSTATUS NTAPI HookedNtWriteFile(
+    HANDLE FileHandle,
+    HANDLE Event,
+    PVOID ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID Buffer,
+    ULONG Length,
+    PLARGE_INTEGER ByteOffset,
+    PULONG Key
+    );
+NTSTATUS NTAPI HookedNtReadVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    ULONG NumberOfBytesToRead,
+    PULONG NumberOfBytesRead
+    );
+NTSTATUS NTAPI HookedNtWriteVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    ULONG NumberOfBytesToWrite,
+    PULONG NumberOfBytesWritten
+    );
+NTSTATUS NTAPI HookedNtSetInformationFile(
+    HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation,
+    ULONG Length,
+    FILE_INFORMATION_CLASS FileInformationClass
+    );
+NTSTATUS NTAPI HookedNtCreateSection(
+    OUT PHANDLE SectionHandle,
+    IN ACCESS_MASK DesiredAccess,
+    IN POBJECT_ATTRIBUTES ObjectAttributes OPTIONAL,
+    IN PLARGE_INTEGER MaximumSize OPTIONAL,
+    IN ULONG SectionPageProtection,
+    IN ULONG AllocationAttributes,
+    IN HANDLE FileHandle OPTIONAL
+    );
+VOID SendEventToUserMode(PAEGIS_EVENT Event);
+BOOLEAN IsDriverBlacklisted(PDRIVER_OBJECT DriverObject);
+VOID CheckForRootkits();
+VOID ProtectDriverObject(PDRIVER_OBJECT DriverObject);
+NTSTATUS CompleteRequest(PIRP Irp, NTSTATUS status, ULONG info);
+
+// Driver entry point
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    NTSTATUS status;
+    UINT32 i;
+    
+    UNREFERENCED_PARAMETER(RegistryPath);
+    
+    DbgPrint("[AEGIS] Driver loading...\n");
+    
+    // Initialize device name and symbolic link
+    RtlInitUnicodeString(&g_DeviceName, L"\\Device\\AegisKernel");
+    RtlInitUnicodeString(&g_SymbolicName, L"\\??\\AegisKernel");
+    
+    // Create device
+    status = IoCreateDevice(
+        DriverObject,
+        0,
+        &g_DeviceName,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        FALSE,
+        &g_DeviceObject
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[AEGIS] Failed to create device: 0x%X\n", status);
+        return status;
+    }
+    
+    // Create symbolic link
+    status = IoCreateSymbolicLink(&g_SymbolicName, &g_DeviceName);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[AEGIS] Failed to create symbolic link: 0x%X\n", status);
+        IoDeleteDevice(g_DeviceObject);
+        return status;
+    }
+    
+    // Set up dispatch routines
+    for (i = 0; i < IRP_MJ_MAXIMUM_FUNCTION; i++) {
+        DriverObject->MajorFunction[i] = DriverCreateClose;
+    }
+    
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DriverDeviceControl;
+    DriverObject->DriverUnload = DriverUnload;
+    
+    // Get KeServiceDescriptorTable address
+    KeServiceDescriptorTable = (PSYSTEM_SERVICE_DESCRIPTOR_TABLE)GetProcAddress(GetModuleHandle(L"ntoskrnl.exe"), "KeServiceDescriptorTable");
+    if (!KeServiceDescriptorTable) {
+        DbgPrint("[AEGIS] Failed to get KeServiceDescriptorTable\n");
+        IoDeleteSymbolicLink(&g_SymbolicName);
+        IoDeleteDevice(g_DeviceObject);
+        return STATUS_UNSUCCESSFUL;
+    }
+    
+    // Save original SSDT
+    g_SSDTSize = KeServiceDescriptorTable->NumberOfServices * sizeof(ULONG);
+    g_SSDTOriginal = ExAllocatePoolWithTag(NonPagedPool, g_SSDTSize, AEGIS_POOL_TAG);
+    if (!g_SSDTOriginal) {
+        DbgPrint("[AEGIS] Failed to allocate memory for SSDT backup\n");
+        IoDeleteSymbolicLink(&g_SymbolicName);
+        IoDeleteDevice(g_DeviceObject);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    RtlCopyMemory(g_SSDTOriginal, KeServiceDescriptorTable->ServiceTableBase, g_SSDTSize);
+    
+    // Protect our driver object
+    ProtectDriverObject(DriverObject);
+    
+    // Hook SSDT
+    HookSSDT();
+    
+    // Check for existing rootkits
+    CheckForRootkits();
+    
+    DbgPrint("[AEGIS] Driver loaded successfully\n");
+    return STATUS_SUCCESS;
+}
+
+// Driver unload routine
+VOID DriverUnload(PDRIVER_OBJECT DriverObject) {
+    DbgPrint("[AEGIS] Driver unloading...\n");
+    
+    // Unhook SSDT
+    UnhookSSDT();
+    
+    // Free SSDT backup
+    if (g_SSDTOriginal) {
+        ExFreePoolWithTag(g_SSDTOriginal, AEGIS_POOL_TAG);
+    }
+    
+    // Delete symbolic link and device
+    IoDeleteSymbolicLink(&g_SymbolicName);
+    IoDeleteDevice(DriverObject->DeviceObject);
+    
+    DbgPrint("[AEGIS] Driver unloaded\n");
+}
+
+// Create and close handler
+NTSTATUS DriverCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    return CompleteRequest(Irp, STATUS_SUCCESS, 0);
+}
+
+// Device control handler
+NTSTATUS DriverDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    
+    PIO_STACK_LOCATION irpSp;
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG info = 0;
+    
+    irpSp = IoGetCurrentIrpStackLocation(Irp);
+    
+    switch (irpSp->Parameters.DeviceIoControl.IoControlCode) {
+        // Add IOCTL codes here for communication with user mode
+        default:
+            status = STATUS_INVALID_DEVICE_REQUEST;
+            break;
+    }
+    
+    return CompleteRequest(Irp, status, info);
+}
+
+// Helper to complete IRP
+NTSTATUS CompleteRequest(PIRP Irp, NTSTATUS status, ULONG info) {
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = info;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+// Hook SSDT functions
+VOID HookSSDT() {
+    DbgPrint("[AEGIS] Hooking SSDT...\n");
+    
+    // Get SSDT base
+    PVOID* SSDTBase = (PVOID*)KeServiceDescriptorTable->ServiceTableBase;
+    
+    // Save original function pointers
+    OriginalNtCreateFile = (PNtCreateFile)SSDTBase[0x25]; // Example index
+    OriginalNtOpenProcess = (PNtOpenProcess)SSDTBase[0x7A]; // Example index
+    OriginalNtWriteFile = (PNtWriteFile)SSDTBase[0x38]; // Example index
+    OriginalNtReadVirtualMemory = (PNtReadVirtualMemory)SSDTBase[0x3F]; // Example index
+    OriginalNtWriteVirtualMemory = (PNtWriteVirtualMemory)SSDTBase[0x115]; // Example index
+    OriginalNtSetInformationFile = (PNtSetInformationFile)SSDTBase[0x40]; // Example index
+    OriginalNtCreateSection = (PNtCreateSection)SSDTBase[0x48]; // Example index
+    
+    // Disable write protection
+    ULONG_PTR cr0 = __readcr0();
+    __writecr0(cr0 & ~0x10000);
+    
+    // Hook functions
+    SSDTBase[0x25] = HookedNtCreateFile;
+    SSDTBase[0x7A] = HookedNtOpenProcess;
+    SSDTBase[0x38] = HookedNtWriteFile;
+    SSDTBase[0x3F] = HookedNtReadVirtualMemory;
+    SSDTBase[0x115] = HookedNtWriteVirtualMemory;
+    SSDTBase[0x40] = HookedNtSetInformationFile;
+    SSDTBase[0x48] = HookedNtCreateSection;
+    
+    // Restore write protection
+    __writecr0(cr0);
+    
+    DbgPrint("[AEGIS] SSDT hooked successfully\n");
+}
+
+// Unhook SSDT functions
+VOID UnhookSSDT() {
+    DbgPrint("[AEGIS] Unhooking SSDT...\n");
+    
+    if (!KeServiceDescriptorTable || !g_SSDTOriginal) {
+        DbgPrint("[AEGIS] Cannot unhook - SSDT or backup not available\n");
+        return;
+    }
+    
+    // Get SSDT base
+    PVOID* SSDTBase = (PVOID*)KeServiceDescriptorTable->ServiceTableBase;
+    
+    // Disable write protection
+    ULONG_PTR cr0 = __readcr0();
+    __writecr0(cr0 & ~0x10000);
+    
+    // Restore original functions
+    SSDTBase[0x25] = OriginalNtCreateFile;
+    SSDTBase[0x7A] = OriginalNtOpenProcess;
+    SSDTBase[0x38] = OriginalNtWriteFile;
+    SSDTBase[0x3F] = HookedNtReadVirtualMemory;
+    SSDTBase[0x115] = OriginalNtWriteVirtualMemory;
+    SSDTBase[0x40] = OriginalNtSetInformationFile;
+    SSDTBase[0x48] = OriginalNtCreateSection;
+    
+    // Restore write protection
+    __writecr0(cr0);
+    
+    DbgPrint("[AEGIS] SSDT unhooked successfully\n");
+}
+
+// Hooked NtCreateFile
+NTSTATUS NTAPI HookedNtCreateFile(
+    PHANDLE FileHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize,
+    ULONG FileAttributes,
+    ULONG ShareAccess,
+    ULONG CreateDisposition,
+    ULONG CreateOptions,
+    PVOID EaBuffer,
+    ULONG EaLength
+    ) {
+    NTSTATUS status;
+    
+    // Log the file creation attempt
+    if (ObjectAttributes && ObjectAttributes->ObjectName) {
+        AEGIS_EVENT event;
+        RtlZeroMemory(&event, sizeof(AEGIS_EVENT));
+        
+        event.ProcessId = PsGetCurrentProcessId();
+        event.ThreadId = PsGetCurrentThreadId();
+        event.EventType = 1; // File creation event
+        event.FilePath = *ObjectAttributes->ObjectName;
+        KeQuerySystemTime(&event.Timestamp);
+        
+        SendEventToUserMode(&event);
+    }
+    
+    // Call original function
+    status = OriginalNtCreateFile(
+        FileHandle,
+        DesiredAccess,
+        ObjectAttributes,
+        IoStatusBlock,
+        AllocationSize,
+        FileAttributes,
+        ShareAccess,
+        CreateDisposition,
+        CreateOptions,
+        EaBuffer,
+        EaLength
+        );
+    
+    return status;
+}
+
+// Hooked NtOpenProcess
+NTSTATUS NTAPI HookedNtOpenProcess(
+    PHANDLE ProcessHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PCLIENT_ID ClientId
+    ) {
+    NTSTATUS status;
+    
+    // Log the process open attempt
+    AEGIS_EVENT event;
+    RtlZeroMemory(&event, sizeof(AEGIS_EVENT));
+    
+    event.ProcessId = PsGetCurrentProcessId();
+    event.ThreadId = PsGetCurrentThreadId();
+    event.EventType = 2; // Process open event
+    
+    if (ClientId) {
+        // Get target process name
+        PEPROCESS targetProcess;
+        if (NT_SUCCESS(PsLookupProcessByProcessId(ClientId->UniqueProcess, &targetProcess))) {
+            PUNICODE_STRING processName;
+            SeLocateProcessImageName(targetProcess, &processName);
+            event.TargetProcess = *processName;
+            ObDereferenceObject(targetProcess);
+        }
+    }
+    
+    KeQuerySystemTime(&event.Timestamp);
+    SendEventToUserMode(&event);
+    
+    // Call original function
+    status = OriginalNtOpenProcess(
+        ProcessHandle,
+        DesiredAccess,
+        ObjectAttributes,
+        ClientId
+        );
+    
+    return status;
+}
+
+// Hooked NtWriteFile
+NTSTATUS NTAPI HookedNtWriteFile(
+    HANDLE FileHandle,
+    HANDLE Event,
+    PVOID ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID Buffer,
+    ULONG Length,
+    PLARGE_INTEGER ByteOffset,
+    PULONG Key
+    ) {
+    NTSTATUS status;
+    
+    // Log the file write attempt
+    AEGIS_EVENT event;
+    RtlZeroMemory(&event, sizeof(AEGIS_EVENT));
+    
+    event.ProcessId = PsGetCurrentProcessId();
+    event.ThreadId = PsGetCurrentThreadId();
+    event.EventType = 3; // File write event
+    
+    // Get file name from handle
+    POBJECT_NAME_INFORMATION nameInfo;
+    ULONG returnLength;
+    
+    nameInfo = (POBJECT_NAME_INFORMATION)ExAllocatePoolWithTag(NonPagedPool, 1024, AEGIS_POOL_TAG);
+    if (nameInfo) {
+        if (NT_SUCCESS(ObQueryNameString(FileHandle, nameInfo, 1024, &returnLength))) {
+            event.FilePath = nameInfo->Name;
+        }
+        ExFreePoolWithTag(nameInfo, AEGIS_POOL_TAG);
+    }
+    
+    KeQuerySystemTime(&event.Timestamp);
+    SendEventToUserMode(&event);
+    
+    // Call original function
+    status = OriginalNtWriteFile(
+        FileHandle,
+        Event,
+        ApcRoutine,
+        ApcContext,
+        IoStatusBlock,
+        Buffer,
+        Length,
+        ByteOffset,
+        Key
+        );
+    
+    return status;
+}
+
+// Hooked NtReadVirtualMemory
+NTSTATUS NTAPI HookedNtReadVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    ULONG NumberOfBytesToRead,
+    PULONG NumberOfBytesRead
+    ) {
+    NTSTATUS status;
+    
+    // Log the memory read attempt
+    AEGIS_EVENT event;
+    RtlZeroMemory(&event, sizeof(AEGIS_EVENT));
+    
+    event.ProcessId = PsGetCurrentProcessId();
+    event.ThreadId = PsGetCurrentThreadId();
+    event.EventType = 4; // Memory read event
+    
+    // Get target process name
+    PEPROCESS targetProcess;
+    if (NT_SUCCESS(ObReferenceObjectByHandle(
+        ProcessHandle,
+        PROCESS_QUERY_INFORMATION,
+        *PsProcessType,
+        KernelMode,
+        (PVOID*)&targetProcess,
+        NULL
+        ))) {
+        PUNICODE_STRING processName;
+        SeLocateProcessImageName(targetProcess, &processName);
+        event.TargetProcess = *processName;
+        ObDereferenceObject(targetProcess);
+    }
+    
+    KeQuerySystemTime(&event.Timestamp);
+    SendEventToUserMode(&event);
+    
+    // Call original function
+    status = OriginalNtReadVirtualMemory(
+        ProcessHandle,
+        BaseAddress,
+        Buffer,
+        NumberOfBytesToRead,
+        NumberOfBytesRead
+        );
+    
+    return status;
+}
+
+// Hooked NtWriteVirtualMemory
+NTSTATUS NTAPI HookedNtWriteVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    PVOID Buffer,
+    ULONG NumberOfBytesToWrite,
+    PULONG NumberOfBytesWritten
+    ) {
+    NTSTATUS status;
+    
+    // Log the memory write attempt
+    AEGIS_EVENT event;
+    RtlZeroMemory(&event, sizeof(AEGIS_EVENT));
+    
+    event.ProcessId = PsGetCurrentProcessId();
+    event.ThreadId = PsGetCurrentThreadId();
+    event.EventType = 5; // Memory write event
+    
+    // Get target process name
+    PEPROCESS targetProcess;
+    if (NT_SUCCESS(ObReferenceObjectByHandle(
+        ProcessHandle,
+        PROCESS_QUERY_INFORMATION,
+        *PsProcessType,
+        KernelMode,
+        (PVOID*)&targetProcess,
+        NULL
+        ))) {
+        PUNICODE_STRING processName;
+        SeLocateProcessImageName(targetProcess, &processName);
+        event.TargetProcess = *processName;
+        ObDereferenceObject(targetProcess);
+    }
+    
+    KeQuerySystemTime(&event.Timestamp);
+    SendEventToUserMode(&event);
+    
+    // Call original function
+    status = OriginalNtWriteVirtualMemory(
+        ProcessHandle,
+        BaseAddress,
+        Buffer,
+        NumberOfBytesToWrite,
+        NumberOfBytesWritten
+        );
+    
+    return status;
+}
+
+// Hooked NtSetInformationFile
+NTSTATUS NTAPI HookedNtSetInformationFile(
+    HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation,
+    ULONG Length,
+    FILE_INFORMATION_CLASS FileInformationClass
+    ) {
+    NTSTATUS status;
+    
+    // Log the file information set attempt
+    AEGIS_EVENT event;
+    RtlZeroMemory(&event, sizeof(AEGIS_EVENT));
+    
+    event.ProcessId = PsGetCurrentProcessId();
+    event.ThreadId = PsGetCurrentThreadId();
+    event.EventType = 6; // File info set event
+    
+    // Get file name from handle
+    POBJECT_NAME_INFORMATION nameInfo;
+    ULONG returnLength;
+    
+    nameInfo = (POBJECT_NAME_INFORMATION)ExAllocatePoolWithTag(NonPagedPool, 1024, AEGIS_POOL_TAG);
+    if (nameInfo) {
+        if (NT_SUCCESS(ObQueryNameString(FileHandle, nameInfo, 1024, &returnLength))) {
+            event.FilePath = nameInfo->Name;
+        }
+        ExFreePoolWithTag(nameInfo, AEGIS_POOL_TAG);
+    }
+    
+    KeQuerySystemTime(&event.Timestamp);
+    SendEventToUserMode(&event);
+    
+    // Call original function
+    status = OriginalNtSetInformationFile(
+        FileHandle,
+        IoStatusBlock,
+        FileInformation,
+        Length,
+        FileInformationClass
+        );
+    
+    return status;
+}
+
+// Hooked NtCreateSection
+NTSTATUS NTAPI HookedNtCreateSection(
+    OUT PHANDLE SectionHandle,
+    IN ACCESS_MASK DesiredAccess,
+    IN POBJECT_ATTRIBUTES ObjectAttributes OPTIONAL,
+    IN PLARGE_INTEGER MaximumSize OPTIONAL,
+    IN ULONG SectionPageProtection,
+    IN ULONG AllocationAttributes,
+    IN HANDLE FileHandle OPTIONAL
+    ) {
+    NTSTATUS status;
+    
+    // Log the section creation attempt
+    AEGIS_EVENT event;
+    RtlZeroMemory(&event, sizeof(AEGIS_EVENT));
+    
+    event.ProcessId = PsGetCurrentProcessId();
+    event.ThreadId = PsGetCurrentThreadId();
+    event.EventType = 7; // Section create event
+    
+    if (FileHandle) {
+        // Get file name from handle
+        POBJECT_NAME_INFORMATION nameInfo;
+        ULONG returnLength;
+        
+        nameInfo = (POBJECT_NAME_INFORMATION)ExAllocatePoolWithTag(NonPagedPool, 1024, AEGIS_POOL_TAG);
+        if (nameInfo) {
+            if (NT_SUCCESS(ObQueryNameString(FileHandle, nameInfo, 1024, &returnLength))) {
+                event.FilePath = nameInfo->Name;
+            }
+            ExFreePoolWithTag(nameInfo, AEGIS_POOL_TAG);
+        }
+    }
+    
+    KeQuerySystemTime(&event.Timestamp);
+    SendEventToUserMode(&event);
+    
+    // Call original function
+    status = OriginalNtCreateSection(
+        SectionHandle,
+        DesiredAccess,
+        ObjectAttributes,
+        MaximumSize,
+        SectionPageProtection,
+        AllocationAttributes,
+        FileHandle
+        );
+    
+    return status;
+}
+
+// Send event to user mode
+VOID SendEventToUserMode(PAEGIS_EVENT Event) {
+    DbgPrint("[AEGIS] Event: PID=%d, Type=%d\n", Event->ProcessId, Event->EventType);
+}
+
+// Check if driver is blacklisted
+BOOLEAN IsDriverBlacklisted(PDRIVER_OBJECT DriverObject) {
+    // Implementation for checking against blacklisted drivers
+    // This would compare driver name, characteristics, etc. against a blacklist
+    return FALSE;
+}
+
+// Check for rootkits
+VOID CheckForRootkits() {
+    DbgPrint("[AEGIS] Checking for rootkits...\n");
+    
+    // Check SSDT hooks
+    PVOID* SSDTBase = (PVOID*)KeServiceDescriptorTable->ServiceTableBase;
+    for (ULONG i = 0; i < KeServiceDescriptorTable->NumberOfServices; i++) {
+        if (SSDTBase[i] != ((PVOID*)g_SSDTOriginal)[i]) {
+            DbgPrint("[AEGIS] SSDT hook detected at index %lu\n", i);
+            
+            AEGIS_EVENT event;
+            RtlZeroMemory(&event, sizeof(AEGIS_EVENT));
+            event.ProcessId = (ULONG)-1; // System event
+            event.EventType = 8; // Rootkit detection event
+            KeQuerySystemTime(&event.Timestamp);
+            SendEventToUserMode(&event);
+        }
+    }
+    
+    // Check for hidden drivers
+    for (PLIST_ENTRY listEntry = DriverObject->DriverSection->Flink;
+        listEntry != DriverObject->DriverSection;
+        listEntry = listEntry->Flink) {
+        
+        PLDR_DATA_TABLE_ENTRY entry = CONTAINING_RECORD(listEntry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+        
+        if (IsDriverBlacklisted(entry->DriverObject)) {
+            DbgPrint("[AEGIS] Blacklisted driver detected: %wZ\n", &entry->BaseDllName);
+            
+            AEGIS_EVENT event;
+            RtlZeroMemory(&event, sizeof(AEGIS_EVENT));
+            event.ProcessId = (ULONG)-1; // System event
+            event.EventType = 8; // Rootkit detection event
+            event.FilePath = entry->BaseDllName;
+            KeQuerySystemTime(&event.Timestamp);
+            SendEventToUserMode(&event);
+        }
+    }
+    
+    DbgPrint("[AEGIS] Rootkit check completed\n");
+}
+
+// Protect driver object
+VOID ProtectDriverObject(PDRIVER_OBJECT DriverObject) {
+    // Increase reference count to prevent unload
+    ObReferenceObject(DriverObject);
+    
+    // Hook DriverUnload to prevent unload
+    DriverObject->DriverUnload = NULL;
+}
